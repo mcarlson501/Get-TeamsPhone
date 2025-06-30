@@ -1,2 +1,2 @@
 # Get-TeamsPhone
-Get-TeamsPhone Script Collection
+An interactive PowerShell script to guide the deployment of Microsoft Teams
