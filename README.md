@@ -1,5 +1,5 @@
 # Get-TeamsPhoneToolkit
-Get-TeamsPhoneToolkit
+
 A community-driven collection of interactive PowerShell scripts, tools, and resources designed to simplify and accelerate the deployment and migration to Microsoft Teams Phone.
 
 Author: Matthew Carlson (Teams Phone Cloud Solutions Architect, Microsoft)
