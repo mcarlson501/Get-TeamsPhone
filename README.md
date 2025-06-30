@@ -2,7 +2,7 @@
 
 A community-driven collection of interactive PowerShell scripts, tools, and resources designed to simplify and accelerate the deployment and migration to Microsoft Teams Phone.
 
-Author: Matthew Carlson (Teams Phone Cloud Solutions Architect, Microsoft)
+Author: Matthew Carlson (Converged Communications Cloud Solutions Architect, Microsoft)
 
 About The Project
 The goal of the Get-TeamsPhoneToolkit is to bridge the gap between official Microsoft Learn documentation and real-world execution. While the official documentation provides the "what," this toolkit provides the "how"—in the form of curated, interactive, and security-conscious script applications.
