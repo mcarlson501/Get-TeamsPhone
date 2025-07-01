@@ -11,7 +11,7 @@
     Author: Matthew Carlson (Microsoft)
     Project: Get-TeamsPhoneToolkit
     Version: 2.0
-    Last Updated: 2025-06-30
+    Last Updated: 2025-06-29
 #>
 
 # ---------------------------------------------------------------------------------------------
@@ -55,6 +55,291 @@ $Global:ModeStatus = ""
 $Global:ResourceAccountUPN = $null
 $Global:SelectedVoiceRoutingPolicy = $null
 $Global:SelectedSharedCallingPolicy = $null
+
+# ---------------------------------------------------------------------------------------------
+# Core Security and Helper Functions (Moved to top to avoid dependency issues)
+# ---------------------------------------------------------------------------------------------
+
+function Protect-SensitiveData {
+    <#
+    .SYNOPSIS
+        Sanitizes log entries to remove sensitive information
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$LogEntry
+    )
+    
+    # Remove phone numbers (basic pattern)
+    $sanitized = $LogEntry -replace '\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_REDACTED]'
+    
+    # Remove email addresses except domain
+    $sanitized = $sanitized -replace '([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', '[USER_REDACTED]@$2'
+    
+    # Remove potential passwords or tokens (anything that looks like a long string)
+    $sanitized = $sanitized -replace '\b[A-Za-z0-9+/]{20,}={0,2}\b', '[TOKEN_REDACTED]'
+    
+    return $sanitized
+}
+
+function Write-SecureAuditLog {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Command,
+        [string]$User = $env:USERNAME,
+        [string]$Source = $env:COMPUTERNAME
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $sanitizedCommand = Protect-SensitiveData -LogEntry $Command
+    
+    # Create structured log entry with security context
+    $logEntry = @{
+        Timestamp = $timestamp
+        User = $User
+        Source = $Source
+        Command = $sanitizedCommand
+        ScriptVersion = "2.0"
+        Mode = $Global:ModeStatus
+    }
+    
+    $formattedEntry = "[$($logEntry.Timestamp)] USER: $($logEntry.User) | SOURCE: $($logEntry.Source) | MODE: $($logEntry.Mode) | COMMAND: $($logEntry.Command)"
+    $Global:AuditLog.Add($formattedEntry) | Out-Null
+    
+    # Also write to Windows Event Log for enterprise environments
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists("TeamsPhoneToolkit")) {
+            New-EventLog -LogName "Application" -Source "TeamsPhoneToolkit"
+        }
+        Write-EventLog -LogName "Application" -Source "TeamsPhoneToolkit" -EventId 1001 -EntryType Information -Message $formattedEntry
+    }
+    catch {
+        # Event log writing is optional, don't break on failure
+    }
+}
+
+function Test-FilePathSecurity {
+    <#
+    .SYNOPSIS
+        Validates file paths to prevent directory traversal and other attacks
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath
+    )
+    
+    # Check for directory traversal attempts
+    if ($FilePath -match '\.\.|\\\\|\/\/|[\x00-\x1f]') {
+        throw "Invalid file path detected. Path contains potentially dangerous characters."
+    }
+    
+    # Ensure path is not too long (Windows limitation)
+    if ($FilePath.Length -gt 260) {
+        throw "File path exceeds maximum length (260 characters)."
+    }
+    
+    # Check for reserved Windows filenames
+    $reservedNames = @('CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9')
+    $fileName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
+    if ($fileName.ToUpper() -in $reservedNames) {
+        throw "File name uses a reserved Windows filename: $fileName"
+    }
+    
+    return $true
+}
+
+function Test-InputInjection {
+    <#
+    .SYNOPSIS
+        Tests input for potential injection attacks
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Input,
+        [string]$Type = "General"
+    )
+    
+    # Check for PowerShell injection patterns
+    $dangerousPatterns = @(
+        'Invoke-Expression',
+        'iex\s',
+        'Invoke-Command',
+        'Start-Process',
+        'cmd\.exe',
+        'powershell\.exe',
+        'System\.Diagnostics',
+        '\$\(',
+        '`',
+        '\|\s*Out-File',
+        '>',
+        '&\s*[a-zA-Z]',
+        ';\s*[a-zA-Z]'
+    )
+    
+    foreach ($pattern in $dangerousPatterns) {
+        if ($Input -match $pattern) {
+            throw "Potentially dangerous input detected: Pattern '$pattern' found in input"
+        }
+    }
+    
+    # Additional validation for UPN format
+    if ($Type -eq "UPN" -and $Input -notmatch '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') {
+        throw "Invalid UPN format. Please provide a valid email address format."
+    }
+    
+    # Additional validation for phone numbers
+    if ($Type -eq "Phone" -and $Input -notmatch '^\+?[1-9]\d{1,14}$') {
+        throw "Invalid phone number format. Please provide a valid international phone number."
+    }
+    
+    return $true
+}
+
+function Get-UserInput {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Prompt,
+        [string]$DefaultValue = "",
+        [string[]]$ValidValues = @(),
+        [switch]$Required = $false,
+        [string]$ValidationPattern = "",
+        [switch]$Sensitive = $false
+    )
+    
+    do {
+        $displayPrompt = $Prompt
+        if ($DefaultValue -and -not $Sensitive) {
+            $displayPrompt += " (default: $DefaultValue)"
+        }
+        if ($ValidValues.Count -gt 0) {
+            $displayPrompt += " [$($ValidValues -join '/')]"
+        }
+        
+        if ($Sensitive) {
+            $secureInput = Read-Host $displayPrompt -AsSecureString
+            $input = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureInput))
+        }
+        else {
+            $input = Read-Host $displayPrompt
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($input) -and $DefaultValue) {
+            $input = $DefaultValue
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($input) -and $Required) {
+            Write-Host "This field is required. Please provide a value." -ForegroundColor Red
+            continue
+        }
+        
+        if ($ValidValues.Count -gt 0 -and $input -notin $ValidValues) {
+            Write-Host "Invalid value. Valid options are: $($ValidValues -join ', ')" -ForegroundColor Red
+            continue
+        }
+        
+        if ($ValidationPattern -and $input -notmatch $ValidationPattern) {
+            Write-Host "Input doesn't match the required format." -ForegroundColor Red
+            continue
+        }
+        
+        # Security validation for all inputs
+        try {
+            Test-InputInjection -Input $input -Type "General"
+        }
+        catch {
+            Write-Host "Security validation failed: $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
+        
+        # Log input received (sanitized)
+        if (-not $Sensitive) {
+            Write-SecureAuditLog -Command "USER_INPUT: Prompt='$Prompt', Value='$(if($input.Length -gt 50) { $input.Substring(0,50) + '...' } else { $input })'"
+        }
+        else {
+            Write-SecureAuditLog -Command "USER_INPUT: Prompt='$Prompt', Value='[SENSITIVE_DATA_REDACTED]'"
+        }
+        
+        return $input
+    } while ($true)
+}
+
+function Test-AdminPrivileges {
+    <#
+    .SYNOPSIS
+        Validates that the current user has appropriate administrative privileges
+    #>
+    try {
+        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+        $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        
+        if (-not $isAdmin) {
+            throw "This script requires elevated privileges. Please run as Administrator."
+        }
+        
+        Write-Host "✓ Administrative privileges verified" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "❌ Administrative privilege check failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Test-RequiredRoles {
+    <#
+    .SYNOPSIS
+        Validates that the current user has the required Azure AD roles
+    #>
+    if ($Global:ReadOnlyMode) {
+        Write-Host "⚠️ Skipping role validation in Read-Only mode" -ForegroundColor Yellow
+        return $true
+    }
+    
+    try {
+        # Check if user has required roles for Teams administration
+        $context = Get-MgContext -ErrorAction SilentlyContinue
+        if (-not $context) {
+            Write-Host "⚠️ Microsoft Graph context not available. Please ensure you have appropriate permissions." -ForegroundColor Yellow
+            return $true  # Allow to continue but warn
+        }
+        
+        # Additional role checks could be implemented here
+        Write-Host "✓ Role validation passed" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "⚠️ Role validation warning: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $true  # Continue with warning rather than blocking
+    }
+}
+
+function New-SecureSession {
+    <#
+    .SYNOPSIS
+        Creates a secure session with additional logging and validation
+    #>
+    param(
+        [string]$SessionId = (New-Guid).ToString()
+    )
+    
+    $sessionInfo = @{
+        SessionId = $SessionId
+        StartTime = Get-Date
+        User = $env:USERNAME
+        Computer = $env:COMPUTERNAME
+        ProcessId = $PID
+        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        ScriptPath = $MyInvocation.ScriptName
+    }
+    
+    Write-SecureAuditLog -Command "SESSION_START: $($sessionInfo | ConvertTo-Json -Compress)"
+    
+    # Store session info globally for reference
+    $Global:SessionInfo = $sessionInfo
+    
+    return $sessionInfo
+}
 
 # ---------------------------------------------------------------------------------------------
 # Helper, Auditing, and Export Functions
@@ -992,8 +1277,6 @@ function Step6-CreateVoiceRoutingPolicy {
                     
                     # Process selection if we're using numbered selection
                     if ($selection -ne $null -and $policiesToUse -ne $null) {
-                    # Process selection if we're using numbered selection
-                    if ($selection -ne $null -and $policiesToUse -ne $null) {
                         try {
                             $selectedIndex = [int]$selection - 1
                             if ($selectedIndex -lt 0 -or $selectedIndex -ge $policiesToUse.Count) {
@@ -1159,8 +1442,6 @@ function Step8-CreateSharedCallingPolicy {
                         $policiesToUse = $existingPolicies
                     }
                     
-                    # Process selection if we're using numbered selection
-                    if ($selection -ne $null -and $policiesToUse -ne $null) {
                     # Process selection if we're using numbered selection
                     if ($selection -ne $null -and $policiesToUse -ne $null) {
                         try {
@@ -1345,8 +1626,6 @@ function Step9-AssignSharedCallingPolicy {
                     
                     # Process selection if we're using numbered selection
                     if ($selection -ne $null -and $policiesToUse -ne $null) {
-                    # Process selection if we're using numbered selection
-                    if ($selection -ne $null -and $policiesToUse -ne $null) {
                         try {
                             $selectedIndex = [int]$selection - 1
                             if ($selectedIndex -lt 0 -or $selectedIndex -ge $policiesToUse.Count) {
@@ -1465,22 +1744,6 @@ function Step9-AssignSharedCallingPolicy {
     
     Continue-Or-Exit
 }
-    foreach ($user in $users) {
-        $i++
-        $upn = $user.UserPrincipalName
-
-        $activity = "Assigning Shared Calling Policy '$policyName'"
-        $status = "Processing user $upn ($i of $totalUsers)"
-        $percentComplete = ($i / $totalUsers) * 100
-        Write-Progress -Activity $activity -Status $status -PercentComplete $percentComplete
-
-        $command = "Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName '$policyName' -Identity '$upn'"
-        $scriptBlock = { Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName $using:policyName -Identity $using:upn }
-        Execute-Command -CommandString $command -ScriptBlock $scriptBlock
-    }
-    Write-Progress -Activity "Assigning Shared Calling Policy" -Completed
-    Continue-Or-Exit
-}
 
 function Step10-ConfigureExtensionDialing {
     Clear-Host
@@ -1522,223 +1785,6 @@ function Step10-ConfigureExtensionDialing {
     Write-Progress -Activity "Configuring Extension Dialing" -Completed
     Continue-Or-Exit
 }
-
-# ---------------------------------------------------------------------------------------------
-# Security and Authentication Functions
-# ---------------------------------------------------------------------------------------------
-function Test-AdminPrivileges {
-    <#
-    .SYNOPSIS
-        Validates that the current user has appropriate administrative privileges
-    #>
-    try {
-        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
-        $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        
-        if (-not $isAdmin) {
-            throw "This script requires elevated privileges. Please run as Administrator."
-        }
-        
-        Write-Host "✓ Administrative privileges verified" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Host "❌ Administrative privilege check failed: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
-    }
-}
-
-function Test-RequiredRoles {
-    <#
-    .SYNOPSIS
-        Validates that the current user has the required Azure AD roles
-    #>
-    if ($Global:ReadOnlyMode) {
-        Write-Host "⚠️ Skipping role validation in Read-Only mode" -ForegroundColor Yellow
-        return $true
-    }
-    
-    try {
-        # Check if user has required roles for Teams administration
-        $context = Get-MgContext -ErrorAction SilentlyContinue
-        if (-not $context) {
-            Write-Host "⚠️ Microsoft Graph context not available. Please ensure you have appropriate permissions." -ForegroundColor Yellow
-            return $true  # Allow to continue but warn
-        }
-        
-        # Additional role checks could be implemented here
-        Write-Host "✓ Role validation passed" -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Host "⚠️ Role validation warning: $($_.Exception.Message)" -ForegroundColor Yellow
-        return $true  # Continue with warning rather than blocking
-    }
-}
-
-function Protect-SensitiveData {
-    <#
-    .SYNOPSIS
-        Sanitizes log entries to remove sensitive information
-    #>
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$LogEntry
-    )
-    
-    # Remove phone numbers (basic pattern)
-    $sanitized = $LogEntry -replace '\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_REDACTED]'
-    
-    # Remove email addresses except domain
-    $sanitized = $sanitized -replace '([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', '[USER_REDACTED]@$2'
-    
-    # Remove potential passwords or tokens (anything that looks like a long string)
-    $sanitized = $sanitized -replace '\b[A-Za-z0-9+/]{20,}={0,2}\b', '[TOKEN_REDACTED]'
-    
-    return $sanitized
-}
-
-function Write-SecureAuditLog {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Command,
-        [string]$User = $env:USERNAME,
-        [string]$Source = $env:COMPUTERNAME
-    )
-    
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $sanitizedCommand = Protect-SensitiveData -LogEntry $Command
-    
-    # Create structured log entry with security context
-    $logEntry = @{
-        Timestamp = $timestamp
-        User = $User
-        Source = $Source
-        Command = $sanitizedCommand
-        ScriptVersion = "2.0"
-        Mode = $Global:ModeStatus
-    }
-    
-    $formattedEntry = "[$($logEntry.Timestamp)] USER: $($logEntry.User) | SOURCE: $($logEntry.Source) | MODE: $($logEntry.Mode) | COMMAND: $($logEntry.Command)"
-    $Global:AuditLog.Add($formattedEntry) | Out-Null
-    
-    # Also write to Windows Event Log for enterprise environments
-    try {
-        if (-not [System.Diagnostics.EventLog]::SourceExists("TeamsPhoneToolkit")) {
-            New-EventLog -LogName "Application" -Source "TeamsPhoneToolkit"
-        }
-        Write-EventLog -LogName "Application" -Source "TeamsPhoneToolkit" -EventId 1001 -EntryType Information -Message $formattedEntry
-    }
-    catch {
-        # Event log writing is optional, don't break on failure
-    }
-}
-
-function Test-FilePathSecurity {
-    <#
-    .SYNOPSIS
-        Validates file paths to prevent directory traversal and other attacks
-    #>
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FilePath
-    )
-    
-    # Check for directory traversal attempts
-    if ($FilePath -match '\.\.|\\\\|\/\/|[\x00-\x1f]') {
-        throw "Invalid file path detected. Path contains potentially dangerous characters."
-    }
-    
-    # Ensure path is not too long (Windows limitation)
-    if ($FilePath.Length -gt 260) {
-        throw "File path exceeds maximum length (260 characters)."
-    }
-    
-    # Check for reserved Windows filenames
-    $reservedNames = @('CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9')
-    $fileName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
-    if ($fileName.ToUpper() -in $reservedNames) {
-        throw "File name uses a reserved Windows filename: $fileName"
-    }
-    
-    return $true
-}
-
-function New-SecureSession {
-    <#
-    .SYNOPSIS
-        Creates a secure session with additional logging and validation
-    #>
-    param(
-        [string]$SessionId = (New-Guid).ToString()
-    )
-    
-    $sessionInfo = @{
-        SessionId = $SessionId
-        StartTime = Get-Date
-        User = $env:USERNAME
-        Computer = $env:COMPUTERNAME
-        ProcessId = $PID
-        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
-        ScriptPath = $MyInvocation.ScriptName
-    }
-    
-    Write-SecureAuditLog -Command "SESSION_START: $($sessionInfo | ConvertTo-Json -Compress)"
-    
-    # Store session info globally for reference
-    $Global:SessionInfo = $sessionInfo
-    
-    return $sessionInfo
-}
-
-function Test-InputInjection {
-    <#
-    .SYNOPSIS
-        Tests input for potential injection attacks
-    #>
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Input,
-        [string]$Type = "General"
-    )
-    
-    # Check for PowerShell injection patterns
-    $dangerousPatterns = @(
-        'Invoke-Expression',
-        'iex\s',
-        'Invoke-Command',
-        'Start-Process',
-        'cmd\.exe',
-        'powershell\.exe',
-        'System\.Diagnostics',
-        '\$\(',
-        '`',
-        '\|\s*Out-File',
-        '>',
-        '&\s*[a-zA-Z]',
-        ';\s*[a-zA-Z]'
-    )
-    
-    foreach ($pattern in $dangerousPatterns) {
-        if ($Input -match $pattern) {
-            throw "Potentially dangerous input detected: Pattern '$pattern' found in input"
-        }
-    }
-    
-    # Additional validation for UPN format
-    if ($Type -eq "UPN" -and $Input -notmatch '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') {
-        throw "Invalid UPN format. Please provide a valid email address format."
-    }
-    
-    # Additional validation for phone numbers
-    if ($Type -eq "Phone" -and $Input -notmatch '^\+?[1-9]\d{1,14}$') {
-        throw "Invalid phone number format. Please provide a valid international phone number."
-    }
-    
-    return $true
-}
-
 
 # ---------------------------------------------------------------------------------------------
 # Menu Functions
