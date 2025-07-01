@@ -3,15 +3,14 @@
     An interactive script to guide administrators through the configuration of Microsoft Teams Shared Calling.
 
 .DESCRIPTION
-    This script, part of the Get-TeamsPhoneToolkit collection, provides a step-by-step guide for deploying Microsoft Teams 
-    Shared Calling. It automates commands, supports bulk operations, and includes audit logging, security confirmations, 
-    and state management for a streamlined experience.
+    This script provides a step-by-step interactive guide for deploying Microsoft Teams Shared Calling, following the
+    official Microsoft Learn documentation. It automates commands, prompts for information, supports bulk operations,
+    and includes audit logging, security confirmations, progress bars, and state management for a streamlined experience.
 
 .NOTES
-    Author: Matthew Carlson (Microsoft)
-    Project: Get-TeamsPhoneToolkit
-    Version: 2.0
-    Last Updated: 2025-06-29
+    Author: Matthew Carlson
+    Version: 1.1
+    Last Updated: 2025-06-30
 #>
 
 # ---------------------------------------------------------------------------------------------
@@ -131,6 +130,82 @@ function Show-CsvInstructions {
     Write-Host ""
 }
 
+function Test-CsvFormat {
+    param(
+        [string]$FilePath,
+        [string[]]$RequiredHeaders
+    )
+    
+    if (-not (Test-Path $FilePath)) {
+        Write-Host "Error: File '$FilePath' not found." -ForegroundColor Red
+        return $false
+    }
+    
+    try {
+        $csvData = Import-Csv -Path $FilePath -ErrorAction Stop
+        if ($csvData.Count -eq 0) {
+            Write-Host "Error: CSV file appears to be empty or has no data rows." -ForegroundColor Red
+            return $false
+        }
+        
+        $csvHeaders = ($csvData | Get-Member -MemberType NoteProperty).Name
+        $missingHeaders = $RequiredHeaders | Where-Object { $_ -notin $csvHeaders }
+        
+        if ($missingHeaders.Count -gt 0) {
+            Write-Host "Error: Missing required columns: $($missingHeaders -join ', ')" -ForegroundColor Red
+            Write-Host "Found columns: $($csvHeaders -join ', ')" -ForegroundColor Yellow
+            return $false
+        }
+        
+        # Validate that UserPrincipalName column has valid email format
+        if ('UserPrincipalName' -in $RequiredHeaders) {
+            $invalidUpns = $csvData | Where-Object { $_.UserPrincipalName -notmatch '^[^@]+@[^@]+\.[^@]+$' }
+            if ($invalidUpns.Count -gt 0) {
+                Write-Host "Error: Invalid UserPrincipalName format found in rows:" -ForegroundColor Red
+                $invalidUpns | ForEach-Object { Write-Host "  - $($_.UserPrincipalName)" -ForegroundColor Red }
+                return $false
+            }
+        }
+        
+        Write-Host "CSV validation successful. Found $($csvData.Count) valid rows." -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Error reading CSV file: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Test-TeamsConnection {
+    if ($Global:ReadOnlyMode) {
+        return $true
+    }
+    
+    try {
+        $context = Get-CsTenant -ErrorAction Stop
+        if ($null -eq $context) {
+            return $false
+        }
+        return $true
+    }
+    catch {
+        Write-Host "Teams connection test failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Validate-PhoneNumber {
+    param(
+        [string]$PhoneNumber
+    )
+    
+    # Basic E.164 format validation
+    if ($PhoneNumber -match '^\+[1-9]\d{1,14}$') {
+        return $true
+    }
+    return $false
+}
+
 
 # ---------------------------------------------------------------------------------------------
 # Introduction and Prerequisites
@@ -138,7 +213,6 @@ function Show-CsvInstructions {
 function Show-Introduction {
     Clear-Host
     Write-Host "========================================================================" -ForegroundColor Green
-    Write-Host "               Get-TeamsPhoneToolkit Script Collection" -ForegroundColor Cyan
     Write-Host "      Interactive Microsoft Teams Shared Calling Deployment Tool" -ForegroundColor Green
     Write-Host "========================================================================" -ForegroundColor Green
     Write-Host ""
@@ -173,13 +247,42 @@ function Connect-ToTeams {
     }
 
     Write-Host "Attempting to connect to Microsoft Teams PowerShell..." -ForegroundColor Cyan
+    
+    # Check if module is available
+    if (-not (Get-Module -ListAvailable -Name MicrosoftTeams)) {
+        Write-Host "Microsoft Teams PowerShell module is not installed." -ForegroundColor Red
+        Write-Host "Please run: Install-Module -Name MicrosoftTeams -Force -AllowClobber" -ForegroundColor Yellow
+        Read-Host "Press Enter to exit..."
+        exit
+    }
+    
     try {
         Import-Module MicrosoftTeams -ErrorAction Stop
-        Connect-MicrosoftTeams -LogLevel INFO
-        Write-Host "Successfully connected to Microsoft Teams." -ForegroundColor Green
+        
+        # Check if already connected
+        if (Test-TeamsConnection) {
+            Write-Host "Already connected to Microsoft Teams." -ForegroundColor Green
+            return
+        }
+        
+        Connect-MicrosoftTeams -LogLevel INFO -ErrorAction Stop
+        
+        # Verify connection
+        if (Test-TeamsConnection) {
+            Write-Host "Successfully connected to Microsoft Teams." -ForegroundColor Green
+            $tenant = Get-CsTenant
+            Write-Host "Connected to tenant: $($tenant.DisplayName)" -ForegroundColor Cyan
+        } else {
+            throw "Connection verification failed"
+        }
     }
     catch {
-        Write-Host "Failed to connect to Microsoft Teams. Please ensure the module is installed and you have the correct permissions." -ForegroundColor Red
+        Write-Host "Failed to connect to Microsoft Teams." -ForegroundColor Red
+        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Please ensure:" -ForegroundColor Yellow
+        Write-Host "- You have the correct permissions (Teams Administrator, User Administrator)" -ForegroundColor Yellow
+        Write-Host "- Your account has MFA configured if required" -ForegroundColor Yellow
+        Write-Host "- The Microsoft Teams PowerShell module is up to date" -ForegroundColor Yellow
         Read-Host "Press Enter to exit..."
         exit
     }
@@ -200,8 +303,9 @@ function Step1-EnableUsersForVoice {
     Show-CsvInstructions -Instruction "Please provide a CSV file containing the users to enable for voice." -Headers @("UserPrincipalName") -SampleRow @("adele.vance@contoso.com")
     $inputFile = Read-Host "Enter the full path to your CSV file"
 
-    if (-not (Test-Path $inputFile)) {
-        Write-Host "File not found." -ForegroundColor Red; Continue-Or-Exit; return
+    if (-not (Test-CsvFormat -FilePath $inputFile -RequiredHeaders @("UserPrincipalName"))) {
+        Continue-Or-Exit
+        return
     }
 
     $users = Import-Csv -Path $inputFile
@@ -215,6 +319,9 @@ function Step1-EnableUsersForVoice {
 
     $totalUsers = $users.Count
     $i = 0
+    $successCount = 0
+    $errorCount = 0
+    
     foreach ($user in $users) {
         $i++
         $upn = $user.UserPrincipalName
@@ -225,10 +332,23 @@ function Step1-EnableUsersForVoice {
         Write-Progress -Activity $activity -Status $status -PercentComplete $percentComplete
 
         $command = "Set-CsPhoneNumberAssignment -Identity '$upn' -EnterpriseVoiceEnabled `$true"
-        $scriptBlock = { Set-CsPhoneNumberAssignment -Identity $using:upn -EnterpriseVoiceEnabled $true }
+        $scriptBlock = { 
+            try {
+                Set-CsPhoneNumberAssignment -Identity $using:upn -EnterpriseVoiceEnabled $true -ErrorAction Stop
+                $using:successCount++
+            }
+            catch {
+                Write-Host "Failed to enable Enterprise Voice for $using:upn : $($_.Exception.Message)" -ForegroundColor Red
+                $using:errorCount++
+            }
+        }
         Execute-Command -CommandString $command -ScriptBlock $scriptBlock
     }
     Write-Progress -Activity "Enabling Enterprise Voice" -Completed
+    
+    if (-not $Global:ReadOnlyMode) {
+        Write-Host "Operation completed. Success: $successCount, Errors: $errorCount" -ForegroundColor $(if ($errorCount -eq 0) { 'Green' } else { 'Yellow' })
+    }
     Continue-Or-Exit
 }
 
@@ -385,15 +505,29 @@ function Step9-AssignSharedCallingPolicy {
         $policyName = Read-Host "Enter the name of the Shared Calling policy to assign"
     }
     else {
-        Get-CsTeamsSharedCallingRoutingPolicy | Select-Object Identity
-        $policyName = Read-Host "Enter the policy name to assign from the list"
+        try {
+            $policies = Get-CsTeamsSharedCallingRoutingPolicy -ErrorAction Stop
+            if ($policies.Count -eq 0) {
+                Write-Host "No Shared Calling policies found. Please create one first." -ForegroundColor Red
+                Continue-Or-Exit
+                return
+            }
+            $policies | Select-Object Identity | Format-Table -AutoSize
+            $policyName = Read-Host "Enter the policy name to assign from the list"
+        }
+        catch {
+            Write-Host "Error retrieving policies: $($_.Exception.Message)" -ForegroundColor Red
+            Continue-Or-Exit
+            return
+        }
     }
     
     Show-CsvInstructions -Instruction "Please provide a CSV file containing the users to assign the policy to." -Headers @("UserPrincipalName") -SampleRow @("megan.bowen@contoso.com")
     $inputFile = Read-Host "Enter the full path to your CSV file"
 
-    if (-not (Test-Path $inputFile)) {
-        Write-Host "File not found." -ForegroundColor Red; Continue-Or-Exit; return
+    if (-not (Test-CsvFormat -FilePath $inputFile -RequiredHeaders @("UserPrincipalName"))) {
+        Continue-Or-Exit
+        return
     }
 
     $users = Import-Csv -Path $inputFile
@@ -407,6 +541,9 @@ function Step9-AssignSharedCallingPolicy {
 
     $totalUsers = $users.Count
     $i = 0
+    $successCount = 0
+    $errorCount = 0
+    
     foreach ($user in $users) {
         $i++
         $upn = $user.UserPrincipalName
@@ -417,10 +554,23 @@ function Step9-AssignSharedCallingPolicy {
         Write-Progress -Activity $activity -Status $status -PercentComplete $percentComplete
 
         $command = "Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName '$policyName' -Identity '$upn'"
-        $scriptBlock = { Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName $using:policyName -Identity $using:upn }
+        $scriptBlock = { 
+            try {
+                Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName $using:policyName -Identity $using:upn -ErrorAction Stop
+                $using:successCount++
+            }
+            catch {
+                Write-Host "Failed to assign policy to $using:upn : $($_.Exception.Message)" -ForegroundColor Red
+                $using:errorCount++
+            }
+        }
         Execute-Command -CommandString $command -ScriptBlock $scriptBlock
     }
     Write-Progress -Activity "Assigning Shared Calling Policy" -Completed
+    
+    if (-not $Global:ReadOnlyMode) {
+        Write-Host "Operation completed. Success: $successCount, Errors: $errorCount" -ForegroundColor $(if ($errorCount -eq 0) { 'Green' } else { 'Yellow' })
+    }
     Continue-Or-Exit
 }
 
@@ -432,11 +582,22 @@ function Step10-ConfigureExtensionDialing {
     Show-CsvInstructions -Instruction "Please provide a CSV file with user phone numbers and extensions." -Headers @("UserPrincipalName","PhoneNumber","Extension") -SampleRow @("alex.wilber@contoso.com","+12223334444","6789")
     $inputFile = Read-Host "Enter the full path to your CSV file"
     
-    if (-not (Test-Path $inputFile)) {
-        Write-Host "File not found." -ForegroundColor Red; Continue-Or-Exit; return
+    if (-not (Test-CsvFormat -FilePath $inputFile -RequiredHeaders @("UserPrincipalName","PhoneNumber","Extension"))) {
+        Continue-Or-Exit
+        return
     }
     
     $users = Import-Csv -Path $inputFile
+    
+    # Validate phone numbers
+    $invalidPhones = $users | Where-Object { -not (Validate-PhoneNumber -PhoneNumber $_.PhoneNumber) }
+    if ($invalidPhones.Count -gt 0) {
+        Write-Host "Error: Invalid phone number format found:" -ForegroundColor Red
+        $invalidPhones | ForEach-Object { Write-Host "  - $($_.UserPrincipalName): $($_.PhoneNumber)" -ForegroundColor Red }
+        Write-Host "Phone numbers must be in E.164 format (e.g., +12223334444)" -ForegroundColor Yellow
+        Continue-Or-Exit
+        return
+    }
 
     $confirmationMessage = "You are about to process assigning extensions and Direct Routing numbers to $($users.Count) users."
     if (-not (Confirm-Action -ConfirmationMessage $confirmationMessage)) {
@@ -447,6 +608,9 @@ function Step10-ConfigureExtensionDialing {
 
     $totalUsers = $users.Count
     $i = 0
+    $successCount = 0
+    $errorCount = 0
+    
     foreach ($user in $users) {
         $i++
         $upn = $user.UserPrincipalName; $phone = $user.PhoneNumber; $ext = $user.Extension
@@ -458,10 +622,23 @@ function Step10-ConfigureExtensionDialing {
 
         $phoneWithExt = "$phone;ext=$ext"
         $command = "Set-CsPhoneNumberAssignment -Identity '$upn' -PhoneNumber `"$phoneWithExt`" -PhoneNumberType DirectRouting"
-        $scriptBlock = { Set-CsPhoneNumberahoneNumberAssignment -Identity $using:upn -PhoneNumber $using:phoneWithExt -PhoneNumberType DirectRouting }
+        $scriptBlock = { 
+            try {
+                Set-CsPhoneNumberAssignment -Identity $using:upn -PhoneNumber $using:phoneWithExt -PhoneNumberType DirectRouting -ErrorAction Stop
+                $using:successCount++
+            }
+            catch {
+                Write-Host "Failed to configure extension for $using:upn : $($_.Exception.Message)" -ForegroundColor Red
+                $using:errorCount++
+            }
+        }
         Execute-Command -CommandString $command -ScriptBlock $scriptBlock
     }
     Write-Progress -Activity "Configuring Extension Dialing" -Completed
+    
+    if (-not $Global:ReadOnlyMode) {
+        Write-Host "Operation completed. Success: $successCount, Errors: $errorCount" -ForegroundColor $(if ($errorCount -eq 0) { 'Green' } else { 'Yellow' })
+    }
     Continue-Or-Exit
 }
 
@@ -503,7 +680,7 @@ function Show-AdvancedMenu {
         $menu.GetEnumerator() | ForEach-Object { Write-Host "$($_.Name). $($_.Value)"}
         $choice = Read-Host "Select an option"
 
-        switch ($choice) {
+        switch ($choice.ToLower()) {
             '1' { Step1-EnableUsersForVoice }
             '2' { Step2-AssignNumberToResourceAccount }
             '3' { Step3-AssociateWithAutoAttendant }
@@ -517,7 +694,7 @@ function Show-AdvancedMenu {
             'b' { return }
             default { Write-Host "Invalid option." -ForegroundColor Red; Read-Host }
         }
-    } while ($choice -ne 'b')
+    } while ($choice.ToLower() -ne 'b')
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -549,13 +726,13 @@ do {
     Write-Host "Q. Quit and Export Log"
     $initialChoice = Read-Host "Select an option"
 
-    switch ($initialChoice) {
+    switch ($initialChoice.ToLower()) {
         '1' { Start-GuidedWalkthrough }
         '2' { Show-AdvancedMenu }
         'q' { break }
         default { Write-Host "Invalid option." -ForegroundColor Red; Read-Host }
     }
-} while ($initialChoice -ne 'q')
+} while ($initialChoice.ToLower() -ne 'q')
 
 Export-AuditLog
 Write-Host "Shared Calling deployment script has finished." -ForegroundColor Green
