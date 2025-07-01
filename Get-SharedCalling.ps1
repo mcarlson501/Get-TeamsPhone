@@ -53,6 +53,8 @@ $Global:AuditLog = [System.Collections.ArrayList]@()
 $Global:ReadOnlyMode = $false
 $Global:ModeStatus = ""
 $Global:ResourceAccountUPN = $null
+$Global:SelectedVoiceRoutingPolicy = $null
+$Global:SelectedSharedCallingPolicy = $null
 
 # ---------------------------------------------------------------------------------------------
 # Helper, Auditing, and Export Functions
@@ -214,7 +216,7 @@ function Show-Introduction {
     Write-Host "It follows the steps outlined in the official Microsoft documentation and includes full audit logging."
     Write-Host ""
     Write-Host "You can follow along with the Microsoft Learn article here:"
-    Write-Host "https://learn.microsoft.com/en-us/microsoftteams/shared-calling-setup"
+    Write-Host "https://learn.microsoft.com/en-us/microsoftteams/shared-calling-configure"
     Write-Host ""
     Write-Host "Prerequisites:" -ForegroundColor Yellow
     Write-Host "1.  You must be running this script with an account that has at least the following roles:"
@@ -499,6 +501,8 @@ function Save-SessionState {
         ResourceAccountUPN = $Global:ResourceAccountUPN
         ModeStatus = $Global:ModeStatus
         ReadOnlyMode = $Global:ReadOnlyMode
+        SelectedVoiceRoutingPolicy = $Global:SelectedVoiceRoutingPolicy
+        SelectedSharedCallingPolicy = $Global:SelectedSharedCallingPolicy
         Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     }
     
@@ -523,7 +527,21 @@ function Restore-SessionState {
     try {
         $sessionState = Get-Content $FilePath | ConvertFrom-Json
         $Global:ResourceAccountUPN = $sessionState.ResourceAccountUPN
+        $Global:SelectedVoiceRoutingPolicy = $sessionState.SelectedVoiceRoutingPolicy
+        $Global:SelectedSharedCallingPolicy = $sessionState.SelectedSharedCallingPolicy
         Write-Host "Restored session state from $($sessionState.Timestamp)" -ForegroundColor Green
+        
+        # Display restored values
+        if ($Global:ResourceAccountUPN) {
+            Write-Host "  Restored Resource Account: $($Global:ResourceAccountUPN)" -ForegroundColor Cyan
+        }
+        if ($Global:SelectedVoiceRoutingPolicy) {
+            Write-Host "  Restored Voice Routing Policy: $($Global:SelectedVoiceRoutingPolicy)" -ForegroundColor Cyan
+        }
+        if ($Global:SelectedSharedCallingPolicy) {
+            Write-Host "  Restored Shared Calling Policy: $($Global:SelectedSharedCallingPolicy)" -ForegroundColor Cyan
+        }
+        
         return $true
     }
     catch {
@@ -724,21 +742,113 @@ function Step4-AssignLocationToResourceAccount {
     $resourceAccountUpn = $Global:ResourceAccountUPN
 
     if (-not [string]::IsNullOrEmpty($resourceAccountUpn)) {
-        if ((Read-Host "Use previously entered resource account '$resourceAccountUpn'? (y/n)") -ne 'y') {
-            $resourceAccountUpn = Read-Host "Enter the UPN of the resource account"
+        $useExisting = Get-UserInput -Prompt "Use previously entered resource account '$resourceAccountUpn'?" -ValidValues @('y','n') -Required
+        if ($useExisting -eq 'n') {
+            $resourceAccountUpn = Get-UserInput -Prompt "Enter the UPN of the resource account" -Required -ValidationPattern '^[^@]+@[^@]+\.[^@]+$'
         }
     }
     else {
-        $resourceAccountUpn = Read-Host "Enter the UPN of the resource account"
+        $resourceAccountUpn = Get-UserInput -Prompt "Enter the UPN of the resource account" -Required -ValidationPattern '^[^@]+@[^@]+\.[^@]+$'
     }
 
     if ($Global:ReadOnlyMode) {
         Write-Host "$($Global:ModeStatus) Skipping live data retrieval. Please provide a placeholder Location ID for logging purposes." -ForegroundColor Yellow
-        $locationId = Read-Host "Enter a placeholder Location ID"
+        $locationId = Get-UserInput -Prompt "Enter a placeholder Location ID" -Required
     }
     else {
-        Get-CsOnlineLisLocation | Format-Table Location, LocationId
-        $locationId = Read-Host "Enter the Location ID from the list above"
+        Write-Host "Retrieving emergency locations from your tenant..." -ForegroundColor Cyan
+        
+        try {
+            $allLocations = Get-CsOnlineLisLocation -ErrorAction Stop
+            $maxDisplayLocations = 20
+            
+            if ($allLocations.Count -eq 0) {
+                Write-Host "No emergency locations found in your tenant." -ForegroundColor Red
+                Write-Host "Please configure emergency locations in the Teams Admin Center first." -ForegroundColor Yellow
+                Continue-Or-Exit
+                return
+            }
+            elseif ($allLocations.Count -gt $maxDisplayLocations) {
+                Write-Host ""
+                Write-Host "⚠️  Large Location Dataset Detected" -ForegroundColor Yellow
+                Write-Host "Your tenant has $($allLocations.Count) emergency locations configured." -ForegroundColor Cyan
+                Write-Host "Displaying only the first $maxDisplayLocations for performance reasons." -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "📋 Limited Emergency Locations List:" -ForegroundColor Cyan
+                Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                
+                $limitedLocations = $allLocations | Select-Object -First $maxDisplayLocations
+                $limitedLocations | Format-Table -Property @(
+                    @{Label="Location"; Expression={$_.Location}; Width=30},
+                    @{Label="LocationId"; Expression={$_.LocationId}; Width=36},
+                    @{Label="Address"; Expression={"$($_.HouseNumber) $($_.StreetName), $($_.City)"}; Width=40}
+                ) -AutoSize
+                
+                Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                Write-Host ""
+                Write-Host "🔍 To find your specific location:" -ForegroundColor Yellow
+                Write-Host "1. Go to Teams Admin Center (https://admin.teams.microsoft.com)" -ForegroundColor White
+                Write-Host "2. Navigate to: Locations > Emergency addresses" -ForegroundColor White
+                Write-Host "3. Find your desired location and copy the Location ID" -ForegroundColor White
+                Write-Host "4. Enter that Location ID below" -ForegroundColor White
+                Write-Host ""
+                
+                $choice = Get-UserInput -Prompt "Choose an option: (1) Use one of the locations above, (2) Enter a specific Location ID" -ValidValues @('1','2') -Required
+                
+                if ($choice -eq '1') {
+                    Write-Host "Available locations from the list above:" -ForegroundColor Cyan
+                    for ($i = 0; $i -lt $limitedLocations.Count; $i++) {
+                        $loc = $limitedLocations[$i]
+                        Write-Host "$($i + 1). $($loc.Location) - $($loc.LocationId)" -ForegroundColor White
+                    }
+                    
+                    $selection = Get-UserInput -Prompt "Select the number of the location you want to use (1-$($limitedLocations.Count))" -Required
+                    
+                    try {
+                        $selectedIndex = [int]$selection - 1
+                        if ($selectedIndex -lt 0 -or $selectedIndex -ge $limitedLocations.Count) {
+                            throw "Invalid selection"
+                        }
+                        $selectedLocation = $limitedLocations[$selectedIndex]
+                        $locationId = $selectedLocation.LocationId
+                        
+                        Write-Host "Selected location: $($selectedLocation.Location) ($locationId)" -ForegroundColor Green
+                        Write-SecureAuditLog -Command "EMERGENCY_LOCATION_SELECTED_FROM_LIST: $($selectedLocation.Location) - $locationId"
+                    }
+                    catch {
+                        Write-Host "Invalid selection. Please try again." -ForegroundColor Red
+                        Continue-Or-Exit
+                        return
+                    }
+                }
+                else {
+                    $locationId = Get-UserInput -Prompt "Enter the Location ID from Teams Admin Center" -Required
+                    Write-SecureAuditLog -Command "EMERGENCY_LOCATION_ID_MANUALLY_ENTERED: $locationId"
+                }
+            }
+            else {
+                # Small list - display all locations
+                Write-Host "📋 Emergency Locations:" -ForegroundColor Cyan
+                Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                
+                $allLocations | Format-Table -Property @(
+                    @{Label="Location"; Expression={$_.Location}; Width=30},
+                    @{Label="LocationId"; Expression={$_.LocationId}; Width=36},
+                    @{Label="Address"; Expression={"$($_.HouseNumber) $($_.StreetName), $($City)"}; Width=40}
+                ) -AutoSize
+                
+                Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                
+                $locationId = Get-UserInput -Prompt "Enter the Location ID from the list above" -Required
+                Write-SecureAuditLog -Command "EMERGENCY_LOCATION_SELECTED_FROM_FULL_LIST: $locationId"
+            }
+        }
+        catch {
+            Write-Host "Error retrieving emergency locations: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Please ensure you have the necessary permissions and try again." -ForegroundColor Yellow
+            $locationId = Get-UserInput -Prompt "Enter the Location ID manually" -Required
+            Write-SecureAuditLog -Command "EMERGENCY_LOCATION_ID_FALLBACK_ENTRY: $locationId"
+        }
     }
     
     $confirmationMessage = "This will process the assignment of location ID '$locationId' to resource account '$resourceAccountUpn'."
@@ -749,8 +859,30 @@ function Step4-AssignLocationToResourceAccount {
     }
 
     $command = "Set-CsPhoneNumberAssignment -Identity '$resourceAccountUpn' -LocationId '$locationId'"
-    $scriptBlock = { Set-CsPhoneNumberAssignment -Identity $using:resourceAccountUpn -LocationId $using:locationId }
-    Execute-Command -CommandString $command -ScriptBlock $scriptBlock
+    $scriptBlock = { 
+        try {
+            Set-CsPhoneNumberAssignment -Identity $using:resourceAccountUpn -LocationId $using:locationId -ErrorAction Stop
+            return @{ Success = $true; Error = $null }
+        }
+        catch {
+            return @{ Success = $false; Error = $_.Exception.Message }
+        }
+    }
+    
+    Write-AuditLog -Command $command
+    if ($Global:ReadOnlyMode) {
+        Write-Host "$($Global:ModeStatus) Command logged but not executed: $command" -ForegroundColor Yellow
+    }
+    else {
+        $result = Invoke-Command -ScriptBlock $scriptBlock
+        if ($result.Success) {
+            Write-Host "✓ Successfully assigned location to resource account" -ForegroundColor Green
+        }
+        else {
+            Write-Host "❌ Error assigning location: $($result.Error)" -ForegroundColor Red
+        }
+    }
+    
     Continue-Or-Exit
 }
 
@@ -767,18 +899,155 @@ function Step6-CreateVoiceRoutingPolicy {
     Write-Host "--- Step 6: Create voice routing policy (No PSTN Usages) $($Global:ModeStatus) ---" -ForegroundColor Yellow
     if ((Continue-Or-Exit) -eq 's') { return }
     
-    $policyName = Read-Host "Enter a name for the new, empty voice routing policy"
-
-    $confirmationMessage = "This will process the creation of a new voice routing policy named '$policyName'."
-    if (-not (Confirm-Action -ConfirmationMessage $confirmationMessage)) {
-        Write-Host "Action cancelled by user." -ForegroundColor Red
-        Continue-Or-Exit
-        return
+    Write-Host "Voice routing policies are required for Shared Calling configuration." -ForegroundColor Cyan
+    Write-Host ""
+    
+    $policyChoice = Get-UserInput -Prompt "Would you like to create a new policy or use an existing one?" -ValidValues @('new','existing') -Required
+    
+    if ($policyChoice -eq 'existing') {
+        # List existing voice routing policies
+        if ($Global:ReadOnlyMode) {
+            Write-Host "$($Global:ModeStatus) Skipping live data retrieval for existing policies." -ForegroundColor Yellow
+            $policyName = Get-UserInput -Prompt "Enter the name of the existing voice routing policy to use" -Required
+        }
+        else {
+            try {
+                $existingPolicies = Get-CsOnlineVoiceRoutingPolicy -ErrorAction Stop
+                if ($existingPolicies.Count -eq 0) {
+                    Write-Host "No existing voice routing policies found. Creating a new one is required." -ForegroundColor Yellow
+                    $policyChoice = 'new'
+                }
+                else {
+                    $maxDisplayPolicies = 20
+                    
+                    if ($existingPolicies.Count -gt $maxDisplayPolicies) {
+                        Write-Host ""
+                        Write-Host "⚠️  Large Policy Dataset Detected" -ForegroundColor Yellow
+                        Write-Host "Your tenant has $($existingPolicies.Count) voice routing policies configured." -ForegroundColor Cyan
+                        Write-Host "Displaying only the first $maxDisplayPolicies for performance reasons." -ForegroundColor Cyan
+                        Write-Host ""
+                        
+                        $limitedPolicies = $existingPolicies | Select-Object -First $maxDisplayPolicies
+                        Write-Host "📋 Limited Voice Routing Policies List:" -ForegroundColor Cyan
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        for ($i = 0; $i -lt $limitedPolicies.Count; $i++) {
+                            $policy = $limitedPolicies[$i]
+                            $usageCount = if ($policy.OnlinePstnUsages) { $policy.OnlinePstnUsages.Count } else { 0 }
+                            Write-Host "$($i + 1). $($policy.Identity) (PSTN Usages: $usageCount)" -ForegroundColor White
+                        }
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        Write-Host ""
+                        Write-Host "🔍 If your desired policy is not listed above:" -ForegroundColor Yellow
+                        Write-Host "Choose option 2 below to enter the policy name directly." -ForegroundColor White
+                        Write-Host ""
+                        
+                        $choice = Get-UserInput -Prompt "Choose an option: (1) Select from list above, (2) Enter specific policy name" -ValidValues @('1','2') -Required
+                        
+                        if ($choice -eq '1') {
+                            $selection = Get-UserInput -Prompt "Select the number of the policy you want to use (1-$($limitedPolicies.Count))" -Required
+                            $policiesToUse = $limitedPolicies
+                        }
+                        else {
+                            $policyName = Get-UserInput -Prompt "Enter the exact name of the Voice Routing Policy" -Required
+                            # Verify the policy exists
+                            $foundPolicy = $existingPolicies | Where-Object { $_.Identity -eq $policyName }
+                            if ($foundPolicy) {
+                                Write-Host "Policy found: $policyName" -ForegroundColor Green
+                                Write-SecureAuditLog -Command "EXISTING_VOICE_ROUTING_POLICY_SELECTED_BY_NAME: $policyName"
+                                
+                                # Check for PSTN usages warning
+                                if ($foundPolicy.OnlinePstnUsages -and $foundPolicy.OnlinePstnUsages.Count -gt 0) {
+                                    Write-Host "⚠️ Warning: Selected policy has PSTN usages. For Shared Calling, an empty policy is typically recommended." -ForegroundColor Yellow
+                                    $continue = Get-UserInput -Prompt "Continue with this policy anyway?" -ValidValues @('y','n') -Required
+                                    if ($continue -eq 'n') {
+                                        $policyChoice = 'new'
+                                        return
+                                    }
+                                }
+                                # Skip the selection process since we found the policy by name
+                                $selection = $null
+                                $policiesToUse = $null
+                            }
+                            else {
+                                Write-Host "Policy '$policyName' not found. Please verify the name and try again." -ForegroundColor Red
+                                Continue-Or-Exit
+                                return
+                            }
+                        }
+                    }
+                    else {
+                        # Small list - display all policies
+                        Write-Host "Existing Voice Routing Policies:" -ForegroundColor Cyan
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        for ($i = 0; $i -lt $existingPolicies.Count; $i++) {
+                            $policy = $existingPolicies[$i]
+                            $usageCount = if ($policy.OnlinePstnUsages) { $policy.OnlinePstnUsages.Count } else { 0 }
+                            Write-Host "$($i + 1). $($policy.Identity) (PSTN Usages: $usageCount)" -ForegroundColor White
+                        }
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        
+                        $selection = Get-UserInput -Prompt "Select the number of the policy you want to use (1-$($existingPolicies.Count))" -Required
+                        $policiesToUse = $existingPolicies
+                    }
+                    
+                    # Process selection if we're using numbered selection
+                    if ($selection -ne $null -and $policiesToUse -ne $null) {
+                    # Process selection if we're using numbered selection
+                    if ($selection -ne $null -and $policiesToUse -ne $null) {
+                        try {
+                            $selectedIndex = [int]$selection - 1
+                            if ($selectedIndex -lt 0 -or $selectedIndex -ge $policiesToUse.Count) {
+                                throw "Invalid selection"
+                            }
+                            $selectedPolicy = $policiesToUse[$selectedIndex]
+                            $policyName = $selectedPolicy.Identity
+                            
+                            Write-Host "Selected policy: $policyName" -ForegroundColor Green
+                            Write-SecureAuditLog -Command "EXISTING_VOICE_ROUTING_POLICY_SELECTED: $policyName"
+                            
+                            # Warn if policy has PSTN usages (might not be suitable for Shared Calling)
+                            if ($selectedPolicy.OnlinePstnUsages -and $selectedPolicy.OnlinePstnUsages.Count -gt 0) {
+                                Write-Host "⚠️ Warning: Selected policy has PSTN usages. For Shared Calling, an empty policy is typically recommended." -ForegroundColor Yellow
+                                $continue = Get-UserInput -Prompt "Continue with this policy anyway?" -ValidValues @('y','n') -Required
+                                if ($continue -eq 'n') {
+                                    $policyChoice = 'new'
+                                }
+                            }
+                        }
+                        catch {
+                            Write-Host "Invalid selection. Please try again." -ForegroundColor Red
+                            Continue-Or-Exit
+                            return
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Host "Error retrieving existing policies: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "Proceeding with new policy creation." -ForegroundColor Yellow
+                $policyChoice = 'new'
+            }
+        }
     }
+    
+    if ($policyChoice -eq 'new') {
+        $policyName = Get-UserInput -Prompt "Enter a name for the new, empty voice routing policy" -Required
+        
+        $confirmationMessage = "This will process the creation of a new voice routing policy named '$policyName'."
+        if (-not (Confirm-Action -ConfirmationMessage $confirmationMessage)) {
+            Write-Host "Action cancelled by user." -ForegroundColor Red
+            Continue-Or-Exit
+            return
+        }
 
-    $command = "New-CsOnlineVoiceRoutingPolicy -Identity '$policyName' -OnlinePstnUsages @()"
-    $scriptBlock = { New-CsOnlineVoiceRoutingPolicy -Identity $using:policyName -OnlinePstnUsages @() }
-    Execute-Command -CommandString $command -ScriptBlock $scriptBlock
+        $command = "New-CsOnlineVoiceRoutingPolicy -Identity '$policyName' -OnlinePstnUsages @()"
+        $scriptBlock = { New-CsOnlineVoiceRoutingPolicy -Identity $using:policyName -OnlinePstnUsages @() }
+        Execute-Command -CommandString $command -ScriptBlock $scriptBlock
+    }
+    
+    # Store the selected/created policy name for potential future use
+    $Global:SelectedVoiceRoutingPolicy = $policyName
+    Write-Host "Voice routing policy configured: $policyName" -ForegroundColor Green
     Continue-Or-Exit
 }
 
@@ -795,32 +1064,185 @@ function Step8-CreateSharedCallingPolicy {
     Write-Host "--- Step 8: Create the Shared Calling policy $($Global:ModeStatus) ---" -ForegroundColor Yellow
     if ((Continue-Or-Exit) -eq 's') { return }
 
-    $policyName = Read-Host "Enter a name for the new Shared Calling policy"
-    $resourceAccountUpn = $Global:ResourceAccountUPN
-
-    if (-not [string]::IsNullOrEmpty($resourceAccountUpn)) {
-        if ((Read-Host "Use previously entered resource account '$resourceAccountUpn'? (y/n)") -ne 'y') {
-            $resourceAccountUpn = Read-Host "Enter the UPN of the resource account"
+    Write-Host "Shared Calling policies define the resource account and emergency numbers for users." -ForegroundColor Cyan
+    Write-Host ""
+    
+    $policyChoice = Get-UserInput -Prompt "Would you like to create a new policy or use an existing one?" -ValidValues @('new','existing') -Required
+    
+    if ($policyChoice -eq 'existing') {
+        # List existing Shared Calling policies
+        if ($Global:ReadOnlyMode) {
+            Write-Host "$($Global:ModeStatus) Skipping live data retrieval for existing policies." -ForegroundColor Yellow
+            $policyName = Get-UserInput -Prompt "Enter the name of the existing Shared Calling policy to use" -Required
+        }
+        else {
+            try {
+                $existingPolicies = Get-CsTeamsSharedCallingRoutingPolicy -ErrorAction Stop
+                if ($existingPolicies.Count -eq 0) {
+                    Write-Host "No existing Shared Calling policies found. Creating a new one is required." -ForegroundColor Yellow
+                    $policyChoice = 'new'
+                }
+                else {
+                    $maxDisplayPolicies = 20
+                    
+                    if ($existingPolicies.Count -gt $maxDisplayPolicies) {
+                        Write-Host ""
+                        Write-Host "⚠️  Large Policy Dataset Detected" -ForegroundColor Yellow
+                        Write-Host "Your tenant has $($existingPolicies.Count) Shared Calling policies configured." -ForegroundColor Cyan
+                        Write-Host "Displaying only the first $maxDisplayPolicies for performance reasons." -ForegroundColor Cyan
+                        Write-Host ""
+                        
+                        $limitedPolicies = $existingPolicies | Select-Object -First $maxDisplayPolicies
+                        Write-Host "📋 Limited Shared Calling Policies List:" -ForegroundColor Cyan
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        for ($i = 0; $i -lt $limitedPolicies.Count; $i++) {
+                            $policy = $limitedPolicies[$i]
+                            $resourceAccount = if ($policy.ResourceAccount) { $policy.ResourceAccount } else { "Not configured" }
+                            $emergencyCount = if ($policy.EmergencyNumbers) { $policy.EmergencyNumbers.Count } else { 0 }
+                            Write-Host "$($i + 1). $($policy.Identity)" -ForegroundColor White
+                            Write-Host "     Resource Account: $resourceAccount" -ForegroundColor Gray
+                            Write-Host "     Emergency Numbers: $emergencyCount configured" -ForegroundColor Gray
+                        }
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        Write-Host ""
+                        Write-Host "🔍 If your desired policy is not listed above:" -ForegroundColor Yellow
+                        Write-Host "Choose option 2 below to enter the policy name directly." -ForegroundColor White
+                        Write-Host ""
+                        
+                        $choice = Get-UserInput -Prompt "Choose an option: (1) Select from list above, (2) Enter specific policy name" -ValidValues @('1','2') -Required
+                        
+                        if ($choice -eq '1') {
+                            $selection = Get-UserInput -Prompt "Select the number of the policy you want to use (1-$($limitedPolicies.Count))" -Required
+                            $policiesToUse = $limitedPolicies
+                        }
+                        else {
+                            $policyName = Get-UserInput -Prompt "Enter the exact name of the Shared Calling Policy" -Required
+                            # Verify the policy exists
+                            $foundPolicy = $existingPolicies | Where-Object { $_.Identity -eq $policyName }
+                            if ($foundPolicy) {
+                                Write-Host "Policy found: $policyName" -ForegroundColor Green
+                                Write-SecureAuditLog -Command "EXISTING_SHARED_CALLING_POLICY_SELECTED_BY_NAME: $policyName"
+                                
+                                # Display policy details
+                                Write-Host ""
+                                Write-Host "Policy Details:" -ForegroundColor Cyan
+                                Write-Host "  Resource Account: $($foundPolicy.ResourceAccount)" -ForegroundColor White
+                                if ($foundPolicy.EmergencyNumbers) {
+                                    Write-Host "  Emergency Numbers: $($foundPolicy.EmergencyNumbers -join ', ')" -ForegroundColor White
+                                }
+                                # Skip the selection process since we found the policy by name
+                                $selection = $null
+                                $policiesToUse = $null
+                            }
+                            else {
+                                Write-Host "Policy '$policyName' not found. Please verify the name and try again." -ForegroundColor Red
+                                Continue-Or-Exit
+                                return
+                            }
+                        }
+                    }
+                    else {
+                        # Small list - display all policies
+                        Write-Host "Existing Shared Calling Policies:" -ForegroundColor Cyan
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        for ($i = 0; $i -lt $existingPolicies.Count; $i++) {
+                            $policy = $existingPolicies[$i]
+                            $resourceAccount = if ($policy.ResourceAccount) { $policy.ResourceAccount } else { "Not configured" }
+                            $emergencyCount = if ($policy.EmergencyNumbers) { $policy.EmergencyNumbers.Count } else { 0 }
+                            Write-Host "$($i + 1). $($policy.Identity)" -ForegroundColor White
+                            Write-Host "     Resource Account: $resourceAccount" -ForegroundColor Gray
+                            Write-Host "     Emergency Numbers: $emergencyCount configured" -ForegroundColor Gray
+                        }
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        
+                        $selection = Get-UserInput -Prompt "Select the number of the policy you want to use (1-$($existingPolicies.Count))" -Required
+                        $policiesToUse = $existingPolicies
+                    }
+                    
+                    # Process selection if we're using numbered selection
+                    if ($selection -ne $null -and $policiesToUse -ne $null) {
+                    # Process selection if we're using numbered selection
+                    if ($selection -ne $null -and $policiesToUse -ne $null) {
+                        try {
+                            $selectedIndex = [int]$selection - 1
+                            if ($selectedIndex -lt 0 -or $selectedIndex -ge $policiesToUse.Count) {
+                                throw "Invalid selection"
+                            }
+                            $selectedPolicy = $policiesToUse[$selectedIndex]
+                            $policyName = $selectedPolicy.Identity
+                            
+                            Write-Host "Selected policy: $policyName" -ForegroundColor Green
+                            Write-SecureAuditLog -Command "EXISTING_SHARED_CALLING_POLICY_SELECTED: $policyName"
+                            
+                            # Display policy details
+                            Write-Host ""
+                            Write-Host "Policy Details:" -ForegroundColor Cyan
+                            Write-Host "  Resource Account: $($selectedPolicy.ResourceAccount)" -ForegroundColor White
+                            if ($selectedPolicy.EmergencyNumbers) {
+                                Write-Host "  Emergency Numbers: $($selectedPolicy.EmergencyNumbers -join ', ')" -ForegroundColor White
+                            }
+                        }
+                        catch {
+                            Write-Host "Invalid selection. Please try again." -ForegroundColor Red
+                            Continue-Or-Exit
+                            return
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Host "Error retrieving existing policies: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "Proceeding with new policy creation." -ForegroundColor Yellow
+                $policyChoice = 'new'
+            }
         }
     }
-    else {
-        $resourceAccountUpn = Read-Host "Enter the UPN of the resource account"
+    
+    if ($policyChoice -eq 'new') {
+        $policyName = Get-UserInput -Prompt "Enter a name for the new Shared Calling policy" -Required
+        $resourceAccountUpn = $Global:ResourceAccountUPN
+
+        if (-not [string]::IsNullOrEmpty($resourceAccountUpn)) {
+            $useExisting = Get-UserInput -Prompt "Use previously entered resource account '$resourceAccountUpn'?" -ValidValues @('y','n') -Required
+            if ($useExisting -eq 'n') {
+                $resourceAccountUpn = Get-UserInput -Prompt "Enter the UPN of the resource account" -Required -ValidationPattern '^[^@]+@[^@]+\.[^@]+$'
+            }
+        }
+        else {
+            $resourceAccountUpn = Get-UserInput -Prompt "Enter the UPN of the resource account" -Required -ValidationPattern '^[^@]+@[^@]+\.[^@]+$'
+        }
+
+        $emergencyNumbersInput = Get-UserInput -Prompt "Enter comma-separated emergency callback numbers (e.g., +1234567890,+0987654321)" -Required
+        $emergencyNumbers = $emergencyNumbersInput -split ',' | ForEach-Object { $_.Trim() }
+
+        # Validate emergency numbers
+        foreach ($number in $emergencyNumbers) {
+            try {
+                Test-InputInjection -Input $number -Type "Phone"
+            }
+            catch {
+                Write-Host "Invalid emergency number format: $number" -ForegroundColor Red
+                Continue-Or-Exit
+                return
+            }
+        }
+
+        $confirmationMessage = "This will process the creation of a new Shared Calling policy named '$policyName' with resource account '$resourceAccountUpn' and $($emergencyNumbers.Count) emergency numbers."
+        if (-not (Confirm-Action -ConfirmationMessage $confirmationMessage)) {
+            Write-Host "Action cancelled by user." -ForegroundColor Red
+            Continue-Or-Exit
+            return
+        }
+
+        $raIdentity = if ($Global:ReadOnlyMode) { $resourceAccountUpn } else { (Get-CsOnlineUser -Identity $resourceAccountUpn).Identity }
+        $command = "New-CsTeamsSharedCallingRoutingPolicy -Identity '$policyName' -ResourceAccount '$raIdentity' -EmergencyNumbers @{add='$($emergencyNumbers -join ',')'}"
+        $scriptBlock = { New-CsTeamsSharedCallingRoutingPolicy -Identity $using:policyName -ResourceAccount $using:raIdentity -EmergencyNumbers @{add=$using:emergencyNumbers} }
+        Execute-Command -CommandString $command -ScriptBlock $scriptBlock
     }
-
-    $emergencyNumbersInput = Read-Host "Enter comma-separated emergency callback numbers"
-    $emergencyNumbers = $emergencyNumbersInput -split ',' | ForEach-Object { $_.Trim() }
-
-    $confirmationMessage = "This will process the creation of a new Shared Calling policy named '$policyName'."
-    if (-not (Confirm-Action -ConfirmationMessage $confirmationMessage)) {
-        Write-Host "Action cancelled by user." -ForegroundColor Red
-        Continue-Or-Exit
-        return
-    }
-
-    $raIdentity = if ($Global:ReadOnlyMode) { $resourceAccountUpn } else { (Get-CsOnlineUser -Identity $resourceAccountUpn).Identity }
-    $command = "New-CsTeamsSharedCallingRoutingPolicy -Identity '$policyName' -ResourceAccount '$raIdentity' -EmergencyNumbers @{add='$($emergencyNumbers -join ',')'}"
-    $scriptBlock = { New-CsTeamsSharedCallingRoutingPolicy -Identity $using:policyName -ResourceAccount $using:raIdentity -EmergencyNumbers @{add=$using:emergencyNumbers} }
-    Execute-Command -CommandString $command -ScriptBlock $scriptBlock
+    
+    # Store the selected/created policy name for potential future use
+    $Global:SelectedSharedCallingPolicy = $policyName
+    Write-Host "Shared Calling policy configured: $policyName" -ForegroundColor Green
     Continue-Or-Exit
 }
 
@@ -830,23 +1252,152 @@ function Step9-AssignSharedCallingPolicy {
     if ((Continue-Or-Exit) -eq 's') { return }
 
     $policyName = ""
-    if ($Global:ReadOnlyMode) {
-        Write-Host "$($Global:ModeStatus) Skipping live data retrieval. Please provide a policy name for logging purposes." -ForegroundColor Yellow
-        $policyName = Read-Host "Enter the name of the Shared Calling policy to assign"
+    
+    # Check if we have a previously selected/created policy
+    if ($Global:SelectedSharedCallingPolicy) {
+        $usePrevious = Get-UserInput -Prompt "Use previously configured Shared Calling policy '$($Global:SelectedSharedCallingPolicy)'?" -ValidValues @('y','n') -Required
+        if ($usePrevious -eq 'y') {
+            $policyName = $Global:SelectedSharedCallingPolicy
+        }
     }
-    else {
-        Get-CsTeamsSharedCallingRoutingPolicy | Select-Object Identity
-        $policyName = Read-Host "Enter the policy name to assign from the list"
+    
+    if (-not $policyName) {
+        if ($Global:ReadOnlyMode) {
+            Write-Host "$($Global:ModeStatus) Skipping live data retrieval. Please provide a policy name for logging purposes." -ForegroundColor Yellow
+            $policyName = Get-UserInput -Prompt "Enter the name of the Shared Calling policy to assign" -Required
+        }
+        else {
+            try {
+                $existingPolicies = Get-CsTeamsSharedCallingRoutingPolicy -ErrorAction Stop
+                if ($existingPolicies.Count -eq 0) {
+                    Write-Host "No Shared Calling policies found. Please create a policy first using Step 8." -ForegroundColor Red
+                    Continue-Or-Exit
+                    return
+                }
+                else {
+                    $maxDisplayPolicies = 20
+                    
+                    if ($existingPolicies.Count -gt $maxDisplayPolicies) {
+                        Write-Host ""
+                        Write-Host "⚠️  Large Policy Dataset Detected" -ForegroundColor Yellow
+                        Write-Host "Your tenant has $($existingPolicies.Count) Shared Calling policies configured." -ForegroundColor Cyan
+                        Write-Host "Displaying only the first $maxDisplayPolicies for performance reasons." -ForegroundColor Cyan
+                        Write-Host ""
+                        
+                        $limitedPolicies = $existingPolicies | Select-Object -First $maxDisplayPolicies
+                        Write-Host "📋 Limited Shared Calling Policies List:" -ForegroundColor Cyan
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        for ($i = 0; $i -lt $limitedPolicies.Count; $i++) {
+                            $policy = $limitedPolicies[$i]
+                            $resourceAccount = if ($policy.ResourceAccount) { $policy.ResourceAccount } else { "Not configured" }
+                            $emergencyCount = if ($policy.EmergencyNumbers) { $policy.EmergencyNumbers.Count } else { 0 }
+                            Write-Host "$($i + 1). $($policy.Identity)" -ForegroundColor White
+                            Write-Host "     Resource Account: $resourceAccount" -ForegroundColor Gray
+                            Write-Host "     Emergency Numbers: $emergencyCount configured" -ForegroundColor Gray
+                        }
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        Write-Host ""
+                        Write-Host "🔍 If your desired policy is not listed above:" -ForegroundColor Yellow
+                        Write-Host "Choose option 2 below to enter the policy name directly." -ForegroundColor White
+                        Write-Host ""
+                        
+                        $choice = Get-UserInput -Prompt "Choose an option: (1) Select from list above, (2) Enter specific policy name" -ValidValues @('1','2') -Required
+                        
+                        if ($choice -eq '1') {
+                            $selection = Get-UserInput -Prompt "Select the number of the policy you want to assign (1-$($limitedPolicies.Count))" -Required
+                            $policiesToUse = $limitedPolicies
+                        }
+                        else {
+                            $policyName = Get-UserInput -Prompt "Enter the exact name of the Shared Calling Policy" -Required
+                            # Verify the policy exists
+                            $foundPolicy = $existingPolicies | Where-Object { $_.Identity -eq $policyName }
+                            if ($foundPolicy) {
+                                Write-Host "Policy found: $policyName" -ForegroundColor Green
+                                Write-SecureAuditLog -Command "SHARED_CALLING_POLICY_SELECTED_FOR_ASSIGNMENT_BY_NAME: $policyName"
+                                # Skip the selection process since we found the policy by name
+                                $selection = $null
+                                $policiesToUse = $null
+                            }
+                            else {
+                                Write-Host "Policy '$policyName' not found. Please verify the name and try again." -ForegroundColor Red
+                                Continue-Or-Exit
+                                return
+                            }
+                        }
+                    }
+                    else {
+                        # Small list - display all policies
+                        Write-Host "Available Shared Calling Policies:" -ForegroundColor Cyan
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        for ($i = 0; $i -lt $existingPolicies.Count; $i++) {
+                            $policy = $existingPolicies[$i]
+                            $resourceAccount = if ($policy.ResourceAccount) { $policy.ResourceAccount } else { "Not configured" }
+                            $emergencyCount = if ($policy.EmergencyNumbers) { $policy.EmergencyNumbers.Count } else { 0 }
+                            Write-Host "$($i + 1). $($policy.Identity)" -ForegroundColor White
+                            Write-Host "     Resource Account: $resourceAccount" -ForegroundColor Gray
+                            Write-Host "     Emergency Numbers: $emergencyCount configured" -ForegroundColor Gray
+                        }
+                        Write-Host "----------------------------------------" -ForegroundColor DarkGray
+                        
+                        $selection = Get-UserInput -Prompt "Select the number of the policy you want to assign (1-$($existingPolicies.Count))" -Required
+                        $policiesToUse = $existingPolicies
+                    }
+                    
+                    # Process selection if we're using numbered selection
+                    if ($selection -ne $null -and $policiesToUse -ne $null) {
+                    # Process selection if we're using numbered selection
+                    if ($selection -ne $null -and $policiesToUse -ne $null) {
+                        try {
+                            $selectedIndex = [int]$selection - 1
+                            if ($selectedIndex -lt 0 -or $selectedIndex -ge $policiesToUse.Count) {
+                                throw "Invalid selection"
+                            }
+                            $selectedPolicy = $policiesToUse[$selectedIndex]
+                            $policyName = $selectedPolicy.Identity
+                            
+                            Write-Host "Selected policy: $policyName" -ForegroundColor Green
+                            Write-SecureAuditLog -Command "SHARED_CALLING_POLICY_SELECTED_FOR_ASSIGNMENT: $policyName"
+                        }
+                        catch {
+                            Write-Host "Invalid selection. Please try again." -ForegroundColor Red
+                            Continue-Or-Exit
+                            return
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Host "Error retrieving existing policies: $($_.Exception.Message)" -ForegroundColor Red
+                $policyName = Get-UserInput -Prompt "Enter the policy name manually" -Required
+            }
+        }
     }
     
     Show-CsvInstructions -Instruction "Please provide a CSV file containing the users to assign the policy to." -Headers @("UserPrincipalName") -SampleRow @("megan.bowen@contoso.com")
-    $inputFile = Read-Host "Enter the full path to your CSV file"
+    
+    $inputFile = ""
+    do {
+        $inputFile = Read-Host "Enter the full path to your CSV file"
+        if ([string]::IsNullOrWhiteSpace($inputFile)) {
+            Write-Host "File path is required." -ForegroundColor Red
+            continue
+        }
+        
+        try {
+            $users = Test-CsvFile -FilePath $inputFile -RequiredHeaders @("UserPrincipalName")
+            break
+        }
+        catch {
+            Write-Host "CSV validation failed: $($_.Exception.Message)" -ForegroundColor Red
+            $retry = Get-UserInput -Prompt "Try again with a different file?" -ValidValues @('y','n') -Required
+            if ($retry -eq 'n') {
+                Continue-Or-Exit
+                return
+            }
+        }
+    } while ($true)
 
-    if (-not (Test-Path $inputFile)) {
-        Write-Host "File not found." -ForegroundColor Red; Continue-Or-Exit; return
-    }
-
-    $users = Import-Csv -Path $inputFile
+    Write-Host "Successfully validated CSV file with $($users.Count) users." -ForegroundColor Green
 
     $confirmationMessage = "You are about to process assigning the Shared Calling policy '$policyName' to $($users.Count) users."
     if (-not (Confirm-Action -ConfirmationMessage $confirmationMessage)) {
@@ -856,7 +1407,64 @@ function Step9-AssignSharedCallingPolicy {
     }
 
     $totalUsers = $users.Count
-    $i = 0
+    $successCount = 0
+    $errorCount = 0
+    $errors = @()
+    
+    for ($i = 0; $i -lt $totalUsers; $i++) {
+        $user = $users[$i]
+        $upn = $user.UserPrincipalName
+
+        $activity = "Assigning Shared Calling Policy '$policyName'"
+        $status = "Processing user $upn ($($i + 1) of $totalUsers)"
+        $percentComplete = (($i + 1) / $totalUsers) * 100
+        Write-Progress -Activity $activity -Status $status -PercentComplete $percentComplete
+
+        $command = "Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName '$policyName' -Identity '$upn'"
+        $scriptBlock = { 
+            try {
+                Grant-CsTeamsSharedCallingRoutingPolicy -PolicyName $using:policyName -Identity $using:upn -ErrorAction Stop
+                return @{ Success = $true; Error = $null }
+            }
+            catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            }
+        }
+        
+        Write-AuditLog -Command $command
+        if ($Global:ReadOnlyMode) {
+            Write-Host "$($Global:ModeStatus) Command logged but not executed: $command" -ForegroundColor Yellow
+            $successCount++
+        }
+        else {
+            $result = Invoke-Command -ScriptBlock $scriptBlock
+            if ($result.Success) {
+                $successCount++
+            }
+            else {
+                $errorCount++
+                $errors += "User $upn : $($result.Error)"
+                Write-Host "Error processing $upn : $($result.Error)" -ForegroundColor Red
+            }
+        }
+    }
+    
+    Write-Progress -Activity "Assigning Shared Calling Policy" -Completed
+    
+    # Summary
+    Write-Host ""
+    Write-Host "=== Operation Summary ===" -ForegroundColor Cyan
+    Write-Host "Policy assigned: $policyName" -ForegroundColor White
+    Write-Host "Total users processed: $totalUsers" -ForegroundColor White
+    Write-Host "Successful: $successCount" -ForegroundColor Green
+    if ($errorCount -gt 0) {
+        Write-Host "Errors: $errorCount" -ForegroundColor Red
+        Write-Host "Error details:" -ForegroundColor Yellow
+        $errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    }
+    
+    Continue-Or-Exit
+}
     foreach ($user in $users) {
         $i++
         $upn = $user.UserPrincipalName
@@ -1210,9 +1818,9 @@ function Show-AdvancedMenu {
             '3' = 'Confirm Auto Attendant Association'
             '4' = 'Assign Location to Resource Account'
             '5' = 'Confirm Number-Specific Settings'
-            '6' = 'Create Voice Routing Policy (No PSTN Usages)'
+            '6' = 'Create/Select Voice Routing Policy (No PSTN Usages)'
             '7' = 'Confirm Emergency Calling Policy for Users'
-            '8' = 'Create Shared Calling Policy'
+            '8' = 'Create/Select Shared Calling Policy'
             '9' = 'Assign Shared Calling Policy to Users'
             '10' = 'Configure Extension Dialing (Optional)'
             'B' = 'Back to Main Menu'
